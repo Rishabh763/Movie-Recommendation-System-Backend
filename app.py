@@ -6,6 +6,14 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import TruncatedSVD
 from flask_cors import CORS
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+key_path = os.getenv("FIREBASE_KEY_PATH")
+
+cred = credentials.Certificate(key_path)
+firebase_admin.initialize_app(cred)
 
 
 
