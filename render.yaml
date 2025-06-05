@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: flask-backend
+    runtime: python
+    buildCommand: ""
+    startCommand: gunicorn app:app
+    envVars:
+      - key: FIREBASE_KEY_PATH
+        value: serviceAccountKey.json
+    env: python
+    region: oregon

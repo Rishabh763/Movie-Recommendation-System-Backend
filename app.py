@@ -10,9 +10,8 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
-key_path = os.getenv("FIREBASE_KEY_PATH")
-
-cred = credentials.Certificate(key_path)
+cred_path = os.getenv("FIREBASE_KEY_PATH", "serviceAccountKey.json")
+cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 
 
