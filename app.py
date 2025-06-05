@@ -12,20 +12,22 @@ import base64
 import tempfile
 import json
 
-# Load .env variables (if running locally)
+# Load .env locally for dev
 load_dotenv()
 
-# Decode Firebase service account key from base64 env var
+# Read and decode the base64 key
 firebase_key_b64 = os.getenv("FIREBASE_KEY_B64")
 if not firebase_key_b64:
     raise Exception("FIREBASE_KEY_B64 environment variable not set.")
 
 decoded_key = base64.b64decode(firebase_key_b64)
+
+# Write to temp file
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
     temp_file.write(decoded_key)
     cred_path = temp_file.name
 
-# Initialize Firebase
+# Initialize Firebase with the decoded key
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
