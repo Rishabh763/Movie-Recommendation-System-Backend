@@ -8,71 +8,41 @@ from sklearn.decomposition import TruncatedSVD
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
+import base64
+import tempfile
+import json
 
+# Load .env variables (if running locally)
 load_dotenv()
-cred_path = os.getenv("FIREBASE_KEY_PATH", "serviceAccountKey.json")
+
+# Decode Firebase service account key from base64 env var
+firebase_key_b64 = os.getenv("FIREBASE_KEY_B64")
+if not firebase_key_b64:
+    raise Exception("FIREBASE_KEY_B64 environment variable not set.")
+
+decoded_key = base64.b64decode(firebase_key_b64)
+with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
+    temp_file.write(decoded_key)
+    cred_path = temp_file.name
+
+# Initialize Firebase
 cred = credentials.Certificate(cred_path)
-firebase_admin.initialize_app(cred)
-
-
-
-
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app) 
-
-
-# Initialize Firebase Admin SDK
-cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 # Load movie metadata
-import json
 with open('data.json', 'r') as f:
     movies = json.load(f)
 
 movie_id_to_title = {m['id']: m['title'] for m in movies}
 
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+
 @app.route("/")
 def home():
     return "🎬 Flask Movie Recommendation API is running!"
-
-
-
-# Dummy movie ID to title map — replace with your actual mapping
-movie_id_to_title = {
-    1: "Beyond Earth",
-    2: "Bottom Gear",
-    3: "Undiscovered Cities",
-    4: "1998",
-    5: "Dark Side of the Moon",
-    6: "The Great Lands",
-    7: "The Diary",
-    8: "Earth’s Untouched",
-    9: "No Land Beyond",
-    10: "During the Hunt",
-    11: "Autosport the Series",
-    12: "Same Answer II",
-    13: "Below Echo",
-    14: "The Rockies",
-    15: "Relentless",
-    16: "Community of Ours",
-    17: "Van Life",
-    18: "The Heiress",
-    19: "Off the Track",
-    20: "Whispering Hill",
-    21: "112",
-    22: "Lone Heart",
-    23: "Production Line",
-    24: "Dogs",
-    25: "Asia in 24 Days",
-    26: "The Tasty Tour",
-    27: "Darker",
-    28: "Unresolved Cases",
-    29: "Mission: Saturn"
-}
-
 
 @app.route("/recommendations", methods=['GET'])
 def get_recommendations():
@@ -83,43 +53,34 @@ def get_recommendations():
     if not uid:
         return jsonify({"error": "Missing uid parameter"}), 400
 
-    # Fetch all ratings from Firestore
-    ratings_ref = db.collection('users')
-    print("Fetched docs:")
-    ratings_docs = list(ratings_ref.stream())  # ✅ Materialize once
-
+    # Fetch ratings
+    ratings_docs = list(db.collection('users').stream())
     ratings = []
     for doc in ratings_docs:
         data = doc.to_dict()
-        print(f"{doc.id}: {data}")  # 👈 Debug print
-
-        user_id = doc.id  # UID is the doc ID
+        user_id = doc.id
         if 'ratings' in data:
             for movie_id_str, rating in data['ratings'].items():
                 try:
                     movie_id = int(movie_id_str)
-                    rating_val = float(rating)  # Ensure numeric type
+                    rating_val = float(rating)
                     ratings.append({
                         "userId": user_id,
                         "movieId": movie_id,
                         "rating": rating_val
                     })
-                except (ValueError, TypeError) as e:
-                    print(f"⚠️ Skipped rating: {movie_id_str}={rating} — {e}")
-
+                except (ValueError, TypeError):
+                    continue
 
     ratings_df = pd.DataFrame(ratings)
-    print(ratings_df)
-
     if ratings_df.empty:
         return jsonify({"error": "No ratings available in database"}), 500
 
-    # Create user-item matrix
+    # User-item matrix
     user_item_matrix = ratings_df.pivot(index='userId', columns='movieId', values='rating').fillna(0)
 
-    # 🔥 Cold start
+    # Cold start
     if uid not in user_item_matrix.index:
-        print("Cold start for user:", uid)
         top_movies = ratings_df.groupby("movieId")["rating"].mean().sort_values(ascending=False).head(top_n).index
         return jsonify({
             "uid": uid,
@@ -127,7 +88,7 @@ def get_recommendations():
             "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_movies]
         })
 
-    # ================= MODEL LOGIC =================
+    # Cosine similarity
     if model_type == "cosine":
         similarity = cosine_similarity(user_item_matrix)
         similarity_df = pd.DataFrame(similarity, index=user_item_matrix.index, columns=user_item_matrix.index)
@@ -149,9 +110,10 @@ def get_recommendations():
 
         top_recs = sorted(weighted_scores, key=weighted_scores.get, reverse=True)[:top_n]
 
+    # SVD
     elif model_type == "svd":
         matrix = user_item_matrix.values
-        svd = TruncatedSVD(n_components=min(10, matrix.shape[1]-1), random_state=42)
+        svd = TruncatedSVD(n_components=min(10, matrix.shape[1] - 1), random_state=42)
         reduced = svd.fit_transform(matrix)
         reconstructed = np.dot(reduced, svd.components_)
         recon_df = pd.DataFrame(reconstructed, index=user_item_matrix.index, columns=user_item_matrix.columns)
@@ -170,12 +132,9 @@ def get_recommendations():
         "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_recs]
     })
 
-
 @app.route("/ratings_dump", methods=['GET'])
 def ratings_dump():
-    ratings_ref = db.collection('users')
-    docs = list(ratings_ref.stream())
-
+    docs = list(db.collection('users').stream())
     out = []
     for doc in docs:
         d = doc.to_dict()
