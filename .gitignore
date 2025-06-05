@@ -1,2 +1,3 @@
 # .gitignore
 serviceAccountKey.json
+venv/
