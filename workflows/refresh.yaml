@@ -1,0 +1,14 @@
+name: Refresh Recommendations
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours UTC
+  workflow_dispatch:  # allows manual run from GitHub
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Curl to refresh endpoint
+        run: |
+          curl -X POST https://movie-recommendation-system-backend-m2xt.onrender.com/refresh

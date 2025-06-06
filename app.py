@@ -7,49 +7,42 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import TruncatedSVD
 from flask_cors import CORS
 from dotenv import load_dotenv
-# from apscheduler.schedulers.background import BackgroundScheduler
 import os
 import base64
 import tempfile
 import json
-import atexit
 
-# Load .env locally
+# Load env
 load_dotenv()
 
-# Read and decode the base64 Firebase key
+# Firebase Key
 firebase_key_b64 = os.getenv("FIREBASE_KEY_B64")
 if not firebase_key_b64:
     raise Exception("FIREBASE_KEY_B64 environment variable not set.")
-
 decoded_key = base64.b64decode(firebase_key_b64)
-
-# Write key to temp file
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
     temp_file.write(decoded_key)
     cred_path = temp_file.name
 
-# Initialize Firebase
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Load movie metadata
+# Load movies
 with open('data.json', 'r') as f:
     movies = json.load(f)
 
 movie_id_to_title = {m['id']: m['title'] for m in movies}
 
-# Initialize Flask app
+# App
 app = Flask(__name__)
 CORS(app)
 
-# Global variable to store ratings
 latest_ratings_df = pd.DataFrame()
+last_refreshed_at = None
 
-# Function to fetch ratings from Firestore
 def fetch_ratings():
-    global latest_ratings_df
+    global latest_ratings_df, last_refreshed_at
     ratings_docs = list(db.collection('users').stream())
     ratings = []
     for doc in ratings_docs:
@@ -67,35 +60,30 @@ def fetch_ratings():
                     })
                 except (ValueError, TypeError):
                     continue
-
     latest_ratings_df = pd.DataFrame(ratings)
-    print(f"[{pd.Timestamp.now()}] Ratings refreshed manually: {len(latest_ratings_df)} entries.")
+    last_refreshed_at = pd.Timestamp.now().isoformat()
+    print(f"[{last_refreshed_at}] Ratings refreshed. Total: {len(latest_ratings_df)}")
 
-# # Scheduler to update ratings every 6 hours (disabled for manual refresh)
-# scheduler = BackgroundScheduler()
-# scheduler.add_job(func=fetch_ratings, trigger="interval", hours=6)
-# scheduler.start()
-
-# Initial fetch on startup
+# Initial fetch
 fetch_ratings()
-
-# Ensure scheduler stops with app (if re-enabled)
-# atexit.register(lambda: scheduler.shutdown())
 
 @app.route("/")
 def home():
     return "🎬 Flask Movie Recommendation API is running!"
 
-@app.route("/refresh", methods=['POST'])
+@app.route("/refresh", methods=['GET', 'POST'])
 def manual_refresh():
     fetch_ratings()
-    return jsonify({"status": "✅ Ratings refreshed manually!"})
+    return jsonify({
+        "status": "✅ Ratings refreshed!",
+        "lastRefreshedAt": last_refreshed_at
+    })
 
 @app.route("/recommendations", methods=['GET'])
 def get_recommendations():
     uid = request.args.get("uid")
     model_type = request.args.get("model", "svd").lower()
-    top_n = 8  # Fixed to 8 always
+    top_n = 8  # Fixed
 
     if not uid:
         return jsonify({"error": "Missing uid parameter"}), 400
@@ -104,19 +92,17 @@ def get_recommendations():
     if ratings_df.empty:
         return jsonify({"error": "No ratings available"}), 500
 
-    # User-item matrix
     user_item_matrix = ratings_df.pivot(index='userId', columns='movieId', values='rating').fillna(0)
 
-    # Cold start
     if uid not in user_item_matrix.index:
         top_movies = ratings_df.groupby("movieId")["rating"].mean().sort_values(ascending=False).head(top_n).index
         return jsonify({
             "uid": uid,
             "model": "cold_start",
-            "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_movies]
+            "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_movies],
+            "lastRefreshedAt": last_refreshed_at
         })
 
-    # Cosine similarity model
     if model_type == "cosine":
         similarity = cosine_similarity(user_item_matrix)
         similarity_df = pd.DataFrame(similarity, index=user_item_matrix.index, columns=user_item_matrix.index)
@@ -138,7 +124,6 @@ def get_recommendations():
 
         top_recs = sorted(weighted_scores, key=weighted_scores.get, reverse=True)[:top_n]
 
-    # SVD model
     elif model_type == "svd":
         matrix = user_item_matrix.values
         svd = TruncatedSVD(n_components=min(10, matrix.shape[1] - 1), random_state=42)
@@ -157,7 +142,8 @@ def get_recommendations():
     return jsonify({
         "uid": uid,
         "model": model_type,
-        "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_recs]
+        "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_recs],
+        "lastRefreshedAt": last_refreshed_at
     })
 
 @app.route("/ratings_dump", methods=['GET'])
