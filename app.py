@@ -7,7 +7,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import TruncatedSVD
 from flask_cors import CORS
 from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
+# from apscheduler.schedulers.background import BackgroundScheduler
 import os
 import base64
 import tempfile
@@ -69,28 +69,33 @@ def fetch_ratings():
                     continue
 
     latest_ratings_df = pd.DataFrame(ratings)
-    print(f"[{pd.Timestamp.now()}] Ratings updated: {len(latest_ratings_df)} entries.")
+    print(f"[{pd.Timestamp.now()}] Ratings refreshed manually: {len(latest_ratings_df)} entries.")
 
-# Scheduler to update ratings every 6 hours
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=fetch_ratings, trigger="interval", hours=6)
-scheduler.start()
+# # Scheduler to update ratings every 6 hours (disabled for manual refresh)
+# scheduler = BackgroundScheduler()
+# scheduler.add_job(func=fetch_ratings, trigger="interval", hours=6)
+# scheduler.start()
 
 # Initial fetch on startup
 fetch_ratings()
 
-# Ensure scheduler stops with app
-atexit.register(lambda: scheduler.shutdown())
+# Ensure scheduler stops with app (if re-enabled)
+# atexit.register(lambda: scheduler.shutdown())
 
 @app.route("/")
 def home():
     return "🎬 Flask Movie Recommendation API is running!"
 
+@app.route("/refresh", methods=['POST'])
+def manual_refresh():
+    fetch_ratings()
+    return jsonify({"status": "✅ Ratings refreshed manually!"})
+
 @app.route("/recommendations", methods=['GET'])
 def get_recommendations():
     uid = request.args.get("uid")
     model_type = request.args.get("model", "svd").lower()
-    top_n = int(request.args.get("top", 5))
+    top_n = 8  # Fixed to 8 always
 
     if not uid:
         return jsonify({"error": "Missing uid parameter"}), 400
