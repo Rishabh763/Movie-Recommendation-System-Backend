@@ -7,27 +7,29 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import TruncatedSVD
 from flask_cors import CORS
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 import os
 import base64
 import tempfile
 import json
+import atexit
 
-# Load .env locally for dev
+# Load .env locally
 load_dotenv()
 
-# Read and decode the base64 key
+# Read and decode the base64 Firebase key
 firebase_key_b64 = os.getenv("FIREBASE_KEY_B64")
 if not firebase_key_b64:
     raise Exception("FIREBASE_KEY_B64 environment variable not set.")
 
 decoded_key = base64.b64decode(firebase_key_b64)
 
-# Write to temp file
+# Write key to temp file
 with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
     temp_file.write(decoded_key)
     cred_path = temp_file.name
 
-# Initialize Firebase with the decoded key
+# Initialize Firebase
 cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
@@ -42,20 +44,12 @@ movie_id_to_title = {m['id']: m['title'] for m in movies}
 app = Flask(__name__)
 CORS(app)
 
-@app.route("/")
-def home():
-    return "🎬 Flask Movie Recommendation API is running!"
+# Global variable to store ratings
+latest_ratings_df = pd.DataFrame()
 
-@app.route("/recommendations", methods=['GET'])
-def get_recommendations():
-    uid = request.args.get("uid")
-    model_type = request.args.get("model", "svd").lower()
-    top_n = int(request.args.get("top", 5))
-
-    if not uid:
-        return jsonify({"error": "Missing uid parameter"}), 400
-
-    # Fetch ratings
+# Function to fetch ratings from Firestore
+def fetch_ratings():
+    global latest_ratings_df
     ratings_docs = list(db.collection('users').stream())
     ratings = []
     for doc in ratings_docs:
@@ -74,9 +68,36 @@ def get_recommendations():
                 except (ValueError, TypeError):
                     continue
 
-    ratings_df = pd.DataFrame(ratings)
+    latest_ratings_df = pd.DataFrame(ratings)
+    print(f"[{pd.Timestamp.now()}] Ratings updated: {len(latest_ratings_df)} entries.")
+
+# Scheduler to update ratings every 6 hours
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=fetch_ratings, trigger="interval", hours=6)
+scheduler.start()
+
+# Initial fetch on startup
+fetch_ratings()
+
+# Ensure scheduler stops with app
+atexit.register(lambda: scheduler.shutdown())
+
+@app.route("/")
+def home():
+    return "🎬 Flask Movie Recommendation API is running!"
+
+@app.route("/recommendations", methods=['GET'])
+def get_recommendations():
+    uid = request.args.get("uid")
+    model_type = request.args.get("model", "svd").lower()
+    top_n = int(request.args.get("top", 5))
+
+    if not uid:
+        return jsonify({"error": "Missing uid parameter"}), 400
+
+    ratings_df = latest_ratings_df.copy()
     if ratings_df.empty:
-        return jsonify({"error": "No ratings available in database"}), 500
+        return jsonify({"error": "No ratings available"}), 500
 
     # User-item matrix
     user_item_matrix = ratings_df.pivot(index='userId', columns='movieId', values='rating').fillna(0)
@@ -90,7 +111,7 @@ def get_recommendations():
             "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_movies]
         })
 
-    # Cosine similarity
+    # Cosine similarity model
     if model_type == "cosine":
         similarity = cosine_similarity(user_item_matrix)
         similarity_df = pd.DataFrame(similarity, index=user_item_matrix.index, columns=user_item_matrix.index)
@@ -112,7 +133,7 @@ def get_recommendations():
 
         top_recs = sorted(weighted_scores, key=weighted_scores.get, reverse=True)[:top_n]
 
-    # SVD
+    # SVD model
     elif model_type == "svd":
         matrix = user_item_matrix.values
         svd = TruncatedSVD(n_components=min(10, matrix.shape[1] - 1), random_state=42)

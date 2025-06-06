@@ -3,3 +3,4 @@ serviceAccountKey.json
 venv/
 __pycache__/
 *.pyc
+firebase_key.txt

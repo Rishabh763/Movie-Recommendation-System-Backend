@@ -6,3 +6,4 @@ scikit-learn
 flask-cors
 python-dotenv
 gunicorn
+apscheduler
