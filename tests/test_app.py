@@ -38,7 +38,7 @@ class FakeDocRef:
 
 class FakeDB:
     def __init__(self):
-        self.collections = {"users": USERS, "tmdb_cache": {}}
+        self.collections = {"users": USERS, "tmdb_cache_v2": {}}
 
     def collection(self, name):
         store = self.collections.setdefault(name, {})
@@ -105,20 +105,28 @@ def test_genres(client):
 
 
 def test_movie_detail_with_tmdb_overview(client, app_module):
-    app_module.tmdb.details = lambda tmdb_id: {"poster_path": "/p.jpg", "overview": "A film."}
+    app_module.tmdb.details = lambda movie_id, **kw: {"poster_path": "/p.jpg", "overview": "A film."}
     body = client.get("/movies/30").get_json()
     assert body["overview"] == "A film." and len(body["similar"]) == 12
     assert client.get("/movies/123456").status_code == 404
 
 
 def test_poster_redirects_and_caches(client, app_module):
-    app_module.tmdb.details = lambda tmdb_id: {"poster_path": "/p.jpg"}
-    res = client.get("/poster/35?size=w500")
+    seen = {}
+
+    def details(movie_id, **kw):
+        seen.update(kw, movie_id=movie_id)
+        return {"poster_path": "/p.jpg"}
+
+    app_module.tmdb.details = details
+    res = client.get("/poster/30?size=w500")
     assert res.status_code == 302
     assert res.headers["Location"] == "https://image.tmdb.org/t/p/w500/p.jpg"
     assert "max-age" in res.headers["Cache-Control"]
-    app_module.tmdb.details = lambda tmdb_id: {"poster_path": None}
-    assert client.get("/poster/35").status_code == 404
+    assert seen["movie_id"] == 30 and seen["tmdb_id"] == 35 and seen["title"] == "Star Wars"
+    app_module.tmdb.details = lambda movie_id, **kw: {"poster_path": None}
+    assert client.get("/poster/30").status_code == 404
+    assert client.get("/poster/999999").status_code == 404
 
 
 def test_recommendations_require_token(client):
@@ -147,17 +155,72 @@ def test_cors_only_allows_known_origins(client):
     assert "Access-Control-Allow-Origin" not in bad.headers
 
 
-def test_tmdb_cache_layers():
+class FakeTMDBSession:
+    """Routes TMDB paths to canned responses and records every call."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def get(self, url, params=None, **kw):
+        path = url.split("/3", 1)[1]
+        self.calls.append(path)
+        body = self.routes.get(path)
+        return mock.Mock(status_code=404 if body is None else 200, json=lambda: body,
+                         raise_for_status=lambda: None)
+
+
+def test_tmdb_movie_then_cache_layers():
     from tmdb import TMDB
 
     db = FakeDB()
-    session = mock.Mock()
-    session.get.return_value = mock.Mock(
-        status_code=200, json=lambda: {"poster_path": "/x.jpg", "overview": "o", "extra": 1})
+    session = FakeTMDBSession({"/movie/5": {"poster_path": "/x.jpg", "overview": "o"}})
     t = TMDB(db=db, token="t", session=session)
-    assert t.poster_url(5, "w185") == "https://image.tmdb.org/t/p/w185/x.jpg"
-    assert db.collections["tmdb_cache"]["5"]["poster_path"] == "/x.jpg"
-    t.poster_url(5)
-    TMDB(db=db, token="t", session=session).details(5)  # new process: served from Firestore
-    assert session.get.call_count == 1
+    assert t.poster_url(1, "w185", tmdb_id=5, title="X", year=2000) == "https://image.tmdb.org/t/p/w185/x.jpg"
+    assert db.collections["tmdb_cache_v2"]["1"]["poster_path"] == "/x.jpg"
+    t.poster_url(1, tmdb_id=5)
+    TMDB(db=db, token="t", session=session).details(1)  # new process: served from Firestore
+    assert session.calls == ["/movie/5"]
     assert TMDB(db=None, token=None).details(7)["poster_path"] is None  # no token: no call
+
+
+def test_tmdb_falls_back_to_tv_id_when_name_matches():
+    from tmdb import TMDB
+
+    session = FakeTMDBSession({"/tv/9": {"name": "Planet Earth", "poster_path": "/pe.jpg"}})
+    info = TMDB(token="t", session=session).details(2, tmdb_id=9, title="Planet Earth", year=2006)
+    assert info["poster_path"] == "/pe.jpg"
+    wrong = FakeTMDBSession({"/tv/9": {"name": "Some Other Show", "poster_path": "/no.jpg"},
+                             "/search/multi": {"results": []}})
+    assert TMDB(token="t", session=wrong).details(3, tmdb_id=9, title="Planet Earth")["poster_path"] is None
+
+
+def test_tmdb_search_fallback_checks_title_and_year():
+    from tmdb import TMDB
+
+    results = {"results": [
+        {"media_type": "person", "name": "Band of Brothers", "poster_path": "/p.jpg"},
+        {"media_type": "tv", "name": "Band of Brothers", "first_air_date": "1990-01-01", "poster_path": "/old.jpg"},
+        {"media_type": "tv", "name": "Band of Brothers", "first_air_date": "2001-09-09", "poster_path": "/bob.jpg"},
+    ]}
+    session = FakeTMDBSession({"/search/multi": results})
+    info = TMDB(token="t", session=session).details(4, tmdb_id=None, title="Band of Brothers", year=2001)
+    assert info["poster_path"] == "/bob.jpg"
+
+
+def test_tmdb_errors_are_not_cached():
+    import requests
+    from tmdb import TMDB
+
+    session = mock.Mock()
+    session.get.side_effect = requests.Timeout()
+    db = FakeDB()
+    assert TMDB(db=db, token="t", session=session).details(5, tmdb_id=1)["poster_path"] is None
+    assert db.collections["tmdb_cache_v2"] == {}
+
+
+def test_titles_match():
+    from tmdb import titles_match
+
+    assert titles_match("The Lives of Others (Das leben der Anderen)", "The Lives of Others")
+    assert titles_match("WALL·E", "WALL-E")  # punctuation-insensitive
+    assert not titles_match("Planet Earth", "Twin Peaks")

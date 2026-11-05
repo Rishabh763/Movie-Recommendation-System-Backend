@@ -99,12 +99,14 @@ peaks at ~185 MB RSS (Render free tier: 512 MB).
 | `GET /movies?ids=1,2,3` | – | Movies by id (bookmarks) |
 | `GET /movies/<id>` | – | Details + TMDB overview + 12 similar movies |
 | `GET /genres` | – | Genre list |
-| `GET /poster/<tmdbId>?size=w342` | – | 302 to the TMDB poster image (cached a week) |
+| `GET /poster/<movieId>?size=w342` | – | 302 to the TMDB poster image (cached a week) |
 | `GET /recommendations?top=20` | Firebase ID token | Personalised picks with `predictedRating`, `because`, `strategy` |
 
 The user comes from the verified token, never from a parameter; their ratings are read
-from Firestore `users/{uid}.mlRatings`. TMDB lookups are cached in memory and in
-Firestore (`tmdb_cache`), so each movie is fetched from TMDB at most once.
+from Firestore `users/{uid}.mlRatings`. Posters are resolved by TMDB movie id, then TV id
+(MovieLens uses TMDB TV ids for miniseries such as *Planet Earth*), then a title + year
+search; results are cached in memory and in Firestore (`tmdb_cache_v2`), so each movie is
+looked up on TMDB at most once.
 
 ## Repository layout
 

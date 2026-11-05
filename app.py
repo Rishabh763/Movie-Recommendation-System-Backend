@@ -130,16 +130,22 @@ def movie_detail(movie_id):
     movie = recommender.get(movie_id)
     if movie is None:
         return jsonify({"error": "Movie not found"}), 404
-    if movie["tmdbId"]:
-        info = tmdb.details(movie["tmdbId"])
-        movie["overview"] = info.get("overview")
+    movie["overview"] = tmdb.details(movie_id, **tmdb_args(movie)).get("overview")
     movie["similar"] = recommender.similar(movie_id, n=int_arg("similar", 12, 1, 30))
     return jsonify(movie)
 
 
-@app.route("/poster/<int:tmdb_id>")
-def poster(tmdb_id):
-    url = tmdb.poster_url(tmdb_id, request.args.get("size", "w342"))
+def tmdb_args(movie):
+    return {"tmdb_id": movie["tmdbId"], "title": movie["title"], "year": movie["year"]}
+
+
+@app.route("/poster/<int:movie_id>")
+def poster(movie_id):
+    """Keyed by MovieLens movieId so the TMDB lookup can fall back to title + year."""
+    movie = recommender.get(movie_id)
+    if movie is None:
+        return jsonify({"error": "Movie not found"}), 404
+    url = tmdb.poster_url(movie_id, request.args.get("size", "w342"), **tmdb_args(movie))
     if not url:
         return jsonify({"error": "No poster"}), 404
     res = redirect(url, code=302)
