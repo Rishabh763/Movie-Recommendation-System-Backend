@@ -1,8 +1,9 @@
 Flask
 firebase-admin
-pandas
 numpy
-scikit-learn
+pandas
+pyarrow
 flask-cors
 python-dotenv
 gunicorn
+requests

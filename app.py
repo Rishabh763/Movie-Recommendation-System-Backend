@@ -1,22 +1,20 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as fb_auth
-import pandas as pd
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.decomposition import TruncatedSVD
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import base64
-import hmac
 import json
 
-# Load env
+from recommender import Recommender, SORTS
+from tmdb import TMDB
+
 load_dotenv()
 
-DEFAULT_TOP_N = 8
-MAX_TOP_N = 20
+DEFAULT_TOP_N = 20
+MAX_TOP_N = 50
+MAX_PAGE_SIZE = 60
 DEFAULT_ORIGINS = (
     "https://movie-recommendation-system-alpha-nine.vercel.app,"
     "http://localhost:5173"
@@ -40,69 +38,18 @@ def load_firebase_credentials():
 firebase_admin.initialize_app(load_firebase_credentials())
 db = firestore.client()
 
-# Load movies
-with open('data.json', 'r') as f:
-    movies = json.load(f)
+recommender = Recommender()
+tmdb = TMDB(db=db)
 
-movie_id_to_title = {m['id']: m['title'] for m in movies}
-
-# App
 app = Flask(__name__)
 allowed_origins = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()
 ]
 CORS(app, origins=allowed_origins)
 
-latest_ratings_df = pd.DataFrame(columns=["userId", "movieId", "rating"])
-last_refreshed_at = None
-
-
-def parse_user_ratings(user_id, data):
-    """Turn one Firestore user document into rating rows, skipping malformed entries."""
-    rows = []
-    for movie_id_str, rating in (data or {}).get('ratings', {}).items():
-        try:
-            rows.append({
-                "userId": user_id,
-                "movieId": int(movie_id_str),
-                "rating": float(rating),
-            })
-        except (ValueError, TypeError):
-            continue
-    return rows
-
-
-def fetch_ratings():
-    global latest_ratings_df, last_refreshed_at
-    ratings = []
-    for doc in db.collection('users').stream():
-        ratings.extend(parse_user_ratings(doc.id, doc.to_dict()))
-    latest_ratings_df = pd.DataFrame(ratings, columns=["userId", "movieId", "rating"])
-    last_refreshed_at = pd.Timestamp.now().isoformat()
-    print(f"[{last_refreshed_at}] Ratings refreshed. Total: {len(latest_ratings_df)}")
-
-
-def ratings_with_fresh_user(uid):
-    """Snapshot of all ratings, with this user's rows re-read from Firestore.
-
-    The full table is only rebuilt by /refresh (every 6 hours), so without this a
-    user who just rated a movie would not see it reflected. One document read per
-    request keeps the requesting user's ratings current.
-    """
-    df = latest_ratings_df
-    df = df[df["userId"] != uid]
-    snap = db.collection('users').document(uid).get()
-    fresh = parse_user_ratings(uid, snap.to_dict() if snap.exists else None)
-    if fresh:
-        df = pd.concat([df, pd.DataFrame(fresh)], ignore_index=True)
-    return df
-
 
 def get_verified_uid():
-    """Return the uid from a valid Firebase ID token in the Authorization header.
-
-    Returns (uid, None) on success or (None, (json, status)) on failure.
-    """
+    """Return (uid, None) for a valid Firebase ID token, else (None, error response)."""
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         return None, (jsonify({"error": "Missing bearer token"}), 401)
@@ -115,109 +62,103 @@ def get_verified_uid():
     return decoded["uid"], None
 
 
-def parse_top_n():
+def int_arg(name, default, lo, hi):
     try:
-        top_n = int(request.args.get("top", DEFAULT_TOP_N))
+        value = int(request.args.get(name, default))
     except (TypeError, ValueError):
-        top_n = DEFAULT_TOP_N
-    return max(1, min(top_n, MAX_TOP_N))
+        value = default
+    return max(lo, min(value, hi))
 
 
-def to_payload(movie_ids):
-    return [
-        {"id": int(mid), "title": movie_id_to_title.get(int(mid), f"Movie {mid}")}
-        for mid in movie_ids
-    ]
-
-
-# Initial fetch
-fetch_ratings()
+def user_ratings(uid):
+    """{movieId: rating} saved by the frontend in users/{uid}.mlRatings."""
+    snap = db.collection("users").document(uid).get()
+    raw = (snap.to_dict() or {}).get("mlRatings", {}) if snap.exists else {}
+    out = {}
+    for movie_id, rating in raw.items():
+        try:
+            rating = float(rating)
+        except (TypeError, ValueError):
+            continue
+        if 0.5 <= rating <= 5.0:
+            out[int(movie_id)] = rating
+    return out
 
 
 @app.route("/")
 def home():
-    return "🎬 Flask Movie Recommendation API is running!"
-
-
-@app.route("/refresh", methods=['POST'])
-def manual_refresh():
-    secret = os.getenv("REFRESH_SECRET")
-    if not secret:
-        return jsonify({"error": "Refresh is disabled: REFRESH_SECRET not set"}), 503
-    provided = request.headers.get("X-Refresh-Token", "")
-    if not hmac.compare_digest(provided.encode(), secret.encode()):
-        return jsonify({"error": "Forbidden"}), 403
-    fetch_ratings()
     return jsonify({
-        "status": "Ratings refreshed",
-        "lastRefreshedAt": last_refreshed_at
+        "status": "ok",
+        "dataset": recommender.meta["dataset"],
+        "movies": len(recommender.items),
+        "model": "implicit ALS + biased MF (fold-in)",
+        "posters": tmdb.enabled,
     })
 
 
-@app.route("/recommendations", methods=['GET'])
-def get_recommendations():
+@app.route("/genres")
+def genres():
+    return jsonify(recommender.all_genres)
+
+
+@app.route("/movies")
+def movies():
+    ids = request.args.get("ids")
+    if ids:
+        try:
+            wanted = [int(x) for x in ids.split(",") if x.strip()][:MAX_PAGE_SIZE]
+        except ValueError:
+            return jsonify({"error": "ids must be comma-separated integers"}), 400
+        return jsonify({"results": recommender.get_many(wanted)})
+    sort = request.args.get("sort", "popular")
+    if sort not in SORTS:
+        return jsonify({"error": f"sort must be one of {sorted(SORTS)}"}), 400
+    genre = request.args.get("genre") or None
+    if genre and genre not in recommender.genre_index:
+        return jsonify({"error": "unknown genre"}), 400
+    return jsonify(recommender.search(
+        q=request.args.get("q", "")[:100],
+        genre=genre,
+        sort=sort,
+        page=int_arg("page", 1, 1, 10_000),
+        page_size=int_arg("pageSize", 24, 1, MAX_PAGE_SIZE),
+    ))
+
+
+@app.route("/movies/<int:movie_id>")
+def movie_detail(movie_id):
+    movie = recommender.get(movie_id)
+    if movie is None:
+        return jsonify({"error": "Movie not found"}), 404
+    if movie["tmdbId"]:
+        info = tmdb.details(movie["tmdbId"])
+        movie["overview"] = info.get("overview")
+    movie["similar"] = recommender.similar(movie_id, n=int_arg("similar", 12, 1, 30))
+    return jsonify(movie)
+
+
+@app.route("/poster/<int:tmdb_id>")
+def poster(tmdb_id):
+    url = tmdb.poster_url(tmdb_id, request.args.get("size", "w342"))
+    if not url:
+        return jsonify({"error": "No poster"}), 404
+    res = redirect(url, code=302)
+    res.headers["Cache-Control"] = "public, max-age=604800"  # browsers reuse it for a week
+    return res
+
+
+@app.route("/recommendations")
+def recommendations():
     uid, err = get_verified_uid()
     if err:
         return err
-
-    model_type = request.args.get("model", "svd").lower()
-    if model_type not in ("svd", "cosine"):
-        return jsonify({"error": "Invalid model. Use 'svd' or 'cosine'."}), 400
-    top_n = parse_top_n()
-
-    ratings_df = ratings_with_fresh_user(uid)
-    if ratings_df.empty:
-        return jsonify({"error": "No ratings available"}), 503
-
-    user_item_matrix = ratings_df.pivot(index='userId', columns='movieId', values='rating').fillna(0)
-
-    if uid not in user_item_matrix.index:
-        top_movies = ratings_df.groupby("movieId")["rating"].mean().sort_values(ascending=False).head(top_n).index
-        return jsonify({
-            "uid": uid,
-            "model": "cold_start",
-            "recommendations": to_payload(top_movies),
-            "lastRefreshedAt": last_refreshed_at
-        })
-
-    if model_type == "cosine":
-        similarity = cosine_similarity(user_item_matrix)
-        similarity_df = pd.DataFrame(similarity, index=user_item_matrix.index, columns=user_item_matrix.index)
-        similar_users = similarity_df[uid].drop(uid)
-
-        weighted_scores = {}
-        for movie in user_item_matrix.columns:
-            if user_item_matrix.loc[uid, movie] > 0:
-                continue
-            total_sim = 0
-            weighted_sum = 0
-            for other_user, sim in similar_users.items():
-                rating = user_item_matrix.loc[other_user, movie]
-                if rating > 0:
-                    weighted_sum += sim * rating
-                    total_sim += sim
-            if total_sim > 0:
-                weighted_scores[movie] = weighted_sum / total_sim
-
-        top_recs = sorted(weighted_scores, key=weighted_scores.get, reverse=True)[:top_n]
-
-    else:  # svd
-        matrix = user_item_matrix.values
-        svd = TruncatedSVD(n_components=min(10, matrix.shape[1] - 1), random_state=42)
-        reduced = svd.fit_transform(matrix)
-        reconstructed = np.dot(reduced, svd.components_)
-        recon_df = pd.DataFrame(reconstructed, index=user_item_matrix.index, columns=user_item_matrix.columns)
-
-        user_row = recon_df.loc[uid]
-        already_rated = user_item_matrix.loc[uid]
-        unrated = user_row[already_rated == 0]
-        top_recs = unrated.sort_values(ascending=False).head(top_n).index.tolist()
-
+    ratings = user_ratings(uid)
+    strategy, recs = recommender.recommend(ratings, n=int_arg("top", DEFAULT_TOP_N, 1, MAX_TOP_N))
     return jsonify({
         "uid": uid,
-        "model": model_type,
-        "recommendations": to_payload(top_recs),
-        "lastRefreshedAt": last_refreshed_at
+        "strategy": strategy,
+        "basedOnRatings": len(ratings),
+        "recommendations": recs,
     })
 
 

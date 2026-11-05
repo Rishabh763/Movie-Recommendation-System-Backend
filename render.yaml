@@ -4,13 +4,14 @@ services:
     runtime: python
     region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 120
+    # Threads let poster redirects and catalog requests run while a recommendation is computed.
+    startCommand: gunicorn app:app --timeout 120 --workers 1 --threads 4
     envVars:
       # Base64 of the Firebase service account JSON. Set in the Render dashboard.
       - key: FIREBASE_KEY_B64
         sync: false
-      # Shared secret for POST /refresh. Must match the GitHub Actions secret.
-      - key: REFRESH_SECRET
+      # TMDB "API Read Access Token" (v4 bearer token) for posters and overviews.
+      - key: TMDB_READ_TOKEN
         sync: false
       - key: ALLOWED_ORIGINS
         value: https://movie-recommendation-system-alpha-nine.vercel.app,http://localhost:5173
