@@ -9,6 +9,11 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Curl to refresh endpoint
+      - name: Call protected refresh endpoint
+        env:
+          REFRESH_SECRET: ${{ secrets.REFRESH_SECRET }}
         run: |
-          curl -X POST https://movie-recommendation-system-backend-m2xt.onrender.com/refresh
+          # --max-time covers Render's free-tier cold start; -f fails the job on 4xx/5xx
+          curl -fsS --max-time 120 -X POST \
+            -H "X-Refresh-Token: ${REFRESH_SECRET}" \
+            https://movie-recommendation-system-backend-m2xt.onrender.com/refresh

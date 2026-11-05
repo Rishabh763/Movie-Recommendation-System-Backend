@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth as fb_auth
 import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -9,23 +9,35 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import base64
-import tempfile
+import hmac
 import json
 
 # Load env
 load_dotenv()
 
-# Firebase Key
-firebase_key_b64 = os.getenv("FIREBASE_KEY_B64")
-if not firebase_key_b64:
-    raise Exception("FIREBASE_KEY_B64 environment variable not set.")
-decoded_key = base64.b64decode(firebase_key_b64)
-with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
-    temp_file.write(decoded_key)
-    cred_path = temp_file.name
+DEFAULT_TOP_N = 8
+MAX_TOP_N = 20
+DEFAULT_ORIGINS = (
+    "https://movie-recommendation-system-alpha-nine.vercel.app,"
+    "http://localhost:5173"
+)
 
-cred = credentials.Certificate(cred_path)
-firebase_admin.initialize_app(cred)
+
+def load_firebase_credentials():
+    """Load the service account from FIREBASE_KEY_B64 (preferred) or FIREBASE_KEY_PATH.
+
+    The decoded key is parsed in memory, so it never touches the disk.
+    """
+    key_b64 = os.getenv("FIREBASE_KEY_B64")
+    if key_b64:
+        return credentials.Certificate(json.loads(base64.b64decode(key_b64)))
+    key_path = os.getenv("FIREBASE_KEY_PATH")
+    if key_path and os.path.exists(key_path):
+        return credentials.Certificate(key_path)
+    raise RuntimeError("Set FIREBASE_KEY_B64 (or FIREBASE_KEY_PATH for local dev).")
+
+
+firebase_admin.initialize_app(load_firebase_credentials())
 db = firestore.client()
 
 # Load movies
@@ -36,61 +48,126 @@ movie_id_to_title = {m['id']: m['title'] for m in movies}
 
 # App
 app = Flask(__name__)
-CORS(app)
+allowed_origins = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()
+]
+CORS(app, origins=allowed_origins)
 
-latest_ratings_df = pd.DataFrame()
+latest_ratings_df = pd.DataFrame(columns=["userId", "movieId", "rating"])
 last_refreshed_at = None
+
+
+def parse_user_ratings(user_id, data):
+    """Turn one Firestore user document into rating rows, skipping malformed entries."""
+    rows = []
+    for movie_id_str, rating in (data or {}).get('ratings', {}).items():
+        try:
+            rows.append({
+                "userId": user_id,
+                "movieId": int(movie_id_str),
+                "rating": float(rating),
+            })
+        except (ValueError, TypeError):
+            continue
+    return rows
+
 
 def fetch_ratings():
     global latest_ratings_df, last_refreshed_at
-    ratings_docs = list(db.collection('users').stream())
     ratings = []
-    for doc in ratings_docs:
-        data = doc.to_dict()
-        user_id = doc.id
-        if 'ratings' in data:
-            for movie_id_str, rating in data['ratings'].items():
-                try:
-                    movie_id = int(movie_id_str)
-                    rating_val = float(rating)
-                    ratings.append({
-                        "userId": user_id,
-                        "movieId": movie_id,
-                        "rating": rating_val
-                    })
-                except (ValueError, TypeError):
-                    continue
-    latest_ratings_df = pd.DataFrame(ratings)
+    for doc in db.collection('users').stream():
+        ratings.extend(parse_user_ratings(doc.id, doc.to_dict()))
+    latest_ratings_df = pd.DataFrame(ratings, columns=["userId", "movieId", "rating"])
     last_refreshed_at = pd.Timestamp.now().isoformat()
     print(f"[{last_refreshed_at}] Ratings refreshed. Total: {len(latest_ratings_df)}")
 
+
+def ratings_with_fresh_user(uid):
+    """Snapshot of all ratings, with this user's rows re-read from Firestore.
+
+    The full table is only rebuilt by /refresh (every 6 hours), so without this a
+    user who just rated a movie would not see it reflected. One document read per
+    request keeps the requesting user's ratings current.
+    """
+    df = latest_ratings_df
+    df = df[df["userId"] != uid]
+    snap = db.collection('users').document(uid).get()
+    fresh = parse_user_ratings(uid, snap.to_dict() if snap.exists else None)
+    if fresh:
+        df = pd.concat([df, pd.DataFrame(fresh)], ignore_index=True)
+    return df
+
+
+def get_verified_uid():
+    """Return the uid from a valid Firebase ID token in the Authorization header.
+
+    Returns (uid, None) on success or (None, (json, status)) on failure.
+    """
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return None, (jsonify({"error": "Missing bearer token"}), 401)
+    try:
+        decoded = fb_auth.verify_id_token(header[len("Bearer "):].strip())
+    except fb_auth.CertificateFetchError:
+        return None, (jsonify({"error": "Could not verify token right now"}), 503)
+    except (ValueError, fb_auth.InvalidIdTokenError, fb_auth.UserDisabledError):
+        return None, (jsonify({"error": "Invalid or expired token"}), 401)
+    return decoded["uid"], None
+
+
+def parse_top_n():
+    try:
+        top_n = int(request.args.get("top", DEFAULT_TOP_N))
+    except (TypeError, ValueError):
+        top_n = DEFAULT_TOP_N
+    return max(1, min(top_n, MAX_TOP_N))
+
+
+def to_payload(movie_ids):
+    return [
+        {"id": int(mid), "title": movie_id_to_title.get(int(mid), f"Movie {mid}")}
+        for mid in movie_ids
+    ]
+
+
 # Initial fetch
 fetch_ratings()
+
 
 @app.route("/")
 def home():
     return "🎬 Flask Movie Recommendation API is running!"
 
-@app.route("/refresh", methods=['GET', 'POST'])
+
+@app.route("/refresh", methods=['POST'])
 def manual_refresh():
+    secret = os.getenv("REFRESH_SECRET")
+    if not secret:
+        return jsonify({"error": "Refresh is disabled: REFRESH_SECRET not set"}), 503
+    provided = request.headers.get("X-Refresh-Token", "")
+    if not hmac.compare_digest(provided.encode(), secret.encode()):
+        return jsonify({"error": "Forbidden"}), 403
     fetch_ratings()
     return jsonify({
-        "status": "✅ Ratings refreshed!",
+        "status": "Ratings refreshed",
         "lastRefreshedAt": last_refreshed_at
     })
 
+
 @app.route("/recommendations", methods=['GET'])
 def get_recommendations():
-    uid = request.args.get("uid")
+    uid, err = get_verified_uid()
+    if err:
+        return err
+
     model_type = request.args.get("model", "svd").lower()
-    top_n = 8  # Fixed
+    if model_type not in ("svd", "cosine"):
+        return jsonify({"error": "Invalid model. Use 'svd' or 'cosine'."}), 400
+    top_n = parse_top_n()
 
-    if not uid:
-        return jsonify({"error": "Missing uid parameter"}), 400
-
-    ratings_df = latest_ratings_df.copy()
+    ratings_df = ratings_with_fresh_user(uid)
     if ratings_df.empty:
-        return jsonify({"error": "No ratings available"}), 500
+        return jsonify({"error": "No ratings available"}), 503
 
     user_item_matrix = ratings_df.pivot(index='userId', columns='movieId', values='rating').fillna(0)
 
@@ -99,7 +176,7 @@ def get_recommendations():
         return jsonify({
             "uid": uid,
             "model": "cold_start",
-            "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_movies],
+            "recommendations": to_payload(top_movies),
             "lastRefreshedAt": last_refreshed_at
         })
 
@@ -124,7 +201,7 @@ def get_recommendations():
 
         top_recs = sorted(weighted_scores, key=weighted_scores.get, reverse=True)[:top_n]
 
-    elif model_type == "svd":
+    else:  # svd
         matrix = user_item_matrix.values
         svd = TruncatedSVD(n_components=min(10, matrix.shape[1] - 1), random_state=42)
         reduced = svd.fit_transform(matrix)
@@ -136,25 +213,13 @@ def get_recommendations():
         unrated = user_row[already_rated == 0]
         top_recs = unrated.sort_values(ascending=False).head(top_n).index.tolist()
 
-    else:
-        return jsonify({"error": "Invalid model. Use 'svd' or 'cosine'."}), 400
-
     return jsonify({
         "uid": uid,
         "model": model_type,
-        "recommendations": [movie_id_to_title.get(mid, f"Movie {mid}") for mid in top_recs],
+        "recommendations": to_payload(top_recs),
         "lastRefreshedAt": last_refreshed_at
     })
 
-@app.route("/ratings_dump", methods=['GET'])
-def ratings_dump():
-    docs = list(db.collection('users').stream())
-    out = []
-    for doc in docs:
-        d = doc.to_dict()
-        d["uid"] = doc.id
-        out.append(d)
-    return jsonify(out)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.getenv("FLASK_DEBUG") == "1")

@@ -2,10 +2,15 @@ services:
   - type: web
     name: flask-backend
     runtime: python
-    buildCommand: ""
-    startCommand: gunicorn app:app
-    envVars:
-      - key: FIREBASE_KEY_PATH
-        value: serviceAccountKey.json
-    env: python
     region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120
+    envVars:
+      # Base64 of the Firebase service account JSON. Set in the Render dashboard.
+      - key: FIREBASE_KEY_B64
+        sync: false
+      # Shared secret for POST /refresh. Must match the GitHub Actions secret.
+      - key: REFRESH_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://movie-recommendation-system-alpha-nine.vercel.app,http://localhost:5173
