@@ -12,8 +12,10 @@ USERS = {
     "alice": {"mlRatings": {"30": 5, "40": 4.5, "50": 4, "60": 5, "70": 1}},
     "bob": {"mlRatings": {"30": 5}, "ratings": {"1": 5}},  # old-format field is ignored
     "carol": {"mlRatings": {"30": "junk", "40": 99}},      # invalid values are dropped
+    "dana": {"mlBookmarks": [30, 40, "x"], "mlViews": {"50": 1700000000000, "60": "bad", "x": 1}},
 }
-TOKENS = {"tok-alice": "alice", "tok-bob": "bob", "tok-carol": "carol", "tok-new": "newbie"}
+TOKENS = {"tok-alice": "alice", "tok-bob": "bob", "tok-carol": "carol", "tok-dana": "dana",
+          "tok-new": "newbie"}
 
 
 class FakeDoc:
@@ -138,6 +140,7 @@ def test_recommendations_use_saved_ml_ratings(client):
     body = client.get("/recommendations?top=8", headers=auth("tok-alice")).get_json()
     assert body["uid"] == "alice" and body["basedOnRatings"] == 5
     assert body["strategy"] == "implicit_als" and len(body["recommendations"]) == 8
+    assert body["signalShares"] == {"rated": 1.0}
     assert not {m["id"] for m in body["recommendations"]} & {30, 40, 50, 60, 70}
 
 
@@ -146,6 +149,15 @@ def test_recommendation_strategies_by_history(client):
     assert client.get("/recommendations", headers=auth("tok-new")).get_json()["strategy"] == "popular"
     carol = client.get("/recommendations", headers=auth("tok-carol")).get_json()
     assert carol["basedOnRatings"] == 0 and carol["strategy"] == "popular"
+
+
+def test_recommendations_use_bookmarks_and_views(client):
+    body = client.get("/recommendations?top=10", headers=auth("tok-dana")).get_json()
+    assert body["signals"] == {"ratings": 0, "bookmarks": 2, "views": 1}
+    assert body["signalShares"] == {"bookmarked": 0.6667, "viewed": 0.3333}
+    assert body["strategy"] == "hybrid"  # 2 * 1.5 + 0.4 < 6
+    assert not {m["id"] for m in body["recommendations"]} & {30, 40, 50}
+    assert all(m["predictedRating"] is None for m in body["recommendations"])
 
 
 def test_cors_only_allows_known_origins(client):

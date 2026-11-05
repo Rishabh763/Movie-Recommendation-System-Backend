@@ -78,19 +78,37 @@ def int_arg(name, default, lo, hi):
     return max(lo, min(value, hi))
 
 
-def user_ratings(uid):
-    """{movieId: rating} saved by the frontend in users/{uid}.mlRatings."""
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def user_signals(uid):
+    """Ratings, bookmarks and page views saved by the frontend in users/{uid}.
+
+    mlRatings   {movieId: stars 0.5-5}
+    mlBookmarks [movieId]
+    mlViews     {movieId: epoch ms of last visit to the movie's page}
+    Malformed entries are dropped.
+    """
     snap = db.collection("users").document(uid).get()
-    raw = (snap.to_dict() or {}).get("mlRatings", {}) if snap.exists else {}
-    out = {}
-    for movie_id, rating in raw.items():
+    doc = (snap.to_dict() or {}) if snap.exists else {}
+    ratings = {}
+    for movie_id, rating in (doc.get("mlRatings") or {}).items():
         try:
             rating = float(rating)
         except (TypeError, ValueError):
             continue
-        if 0.5 <= rating <= 5.0:
-            out[int(movie_id)] = rating
-    return out
+        if _as_int(movie_id) is not None and 0.5 <= rating <= 5.0:
+            ratings[int(movie_id)] = rating
+    bookmarks = [b for b in map(_as_int, doc.get("mlBookmarks") or []) if b is not None]
+    views = {}
+    for movie_id, ts in (doc.get("mlViews") or {}).items():
+        if _as_int(movie_id) is not None and isinstance(ts, (int, float)):
+            views[int(movie_id)] = ts
+    return ratings, bookmarks, views
 
 
 @app.route("/")
@@ -166,12 +184,15 @@ def recommendations():
     uid, err = get_verified_uid()
     if err:
         return err
-    ratings = user_ratings(uid)
-    strategy, recs = recommender.recommend(ratings, n=int_arg("top", DEFAULT_TOP_N, 1, MAX_TOP_N))
+    ratings, bookmarks, views = user_signals(uid)
+    strategy, recs, shares = recommender.recommend(
+        ratings, n=int_arg("top", DEFAULT_TOP_N, 1, MAX_TOP_N), bookmarks=bookmarks, views=views)
     return jsonify({
         "uid": uid,
         "strategy": strategy,
         "basedOnRatings": len(ratings),
+        "signals": {"ratings": len(ratings), "bookmarks": len(bookmarks), "views": len(views)},
+        "signalShares": shares,
         "recommendations": recs,
     })
 

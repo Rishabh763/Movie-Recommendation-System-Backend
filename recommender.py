@@ -21,7 +21,24 @@ import pandas as pd
 
 ARTIFACTS = Path(__file__).resolve().parent / "artifacts"
 LIKED_THRESHOLD = 3.5      # ratings at or above this count as "liked" for explanations
-HYBRID_MAX_RATINGS = 4     # below this many ratings, blend in genre-based content scores
+
+# How much each kind of signal steers the ranking, like an e-commerce funnel
+# (purchase > add to cart > view). Each kind gets its own fold-in user vector; their
+# catalog scores are z-normalised and mixed with these shares, so 20 casual page views
+# can never outweigh a handful of ratings just by count. Missing kinds are dropped and
+# the remaining shares rescaled to sum to 1.
+SIGNAL_SHARES = {"rated": 0.7, "bookmarked": 0.2, "viewed": 0.1}
+
+# Confidence of a single item *within* its kind, in confidence_weight(rating) units
+# (5-star = 3.0, 4-star = 2.0, 3-star = 1.0, <= 2.5-star = 0.5).
+BOOKMARK_WEIGHT = 1.5
+VIEW_WEIGHT = 0.4
+MAX_VIEWS = 100            # only the most recent page views are used
+HYBRID_MIN_WEIGHT = 6.0    # below this total confidence (~4 good ratings), blend in genres
+# Genre-profile preference per signal: rating r contributes (r - 3); bookmark/view are mild likes.
+BOOKMARK_PREF, VIEW_PREF = 1.0, 0.5
+# When explaining a pick, prefer stronger signals for equally similar source movies.
+REASON_PRIORITY = {"rated": 1.0, "bookmarked": 0.9, "viewed": 0.8}
 SORTS = {"popular", "rating", "year", "title"}
 # MovieLens stores "Dark Knight, The" and "Lives of Others, The (Das Leben der Anderen)".
 _ARTICLE_RE = re.compile(
@@ -136,8 +153,12 @@ class Recommender:
 
     # ---------------------------------------------------------------- fold-in
     def fold_in_ials(self, idx, ratings):
+        return self.fold_in_ials_weighted(idx, confidence_weight(ratings))
+
+    def fold_in_ials_weighted(self, idx, weights):
+        """Fold-in with arbitrary per-item signal weights (ratings, bookmarks, views)."""
         Yr = self.Y[idx].astype(np.float64)
-        c = self.alpha * confidence_weight(ratings)
+        c = self.alpha * np.asarray(weights, dtype=np.float64)
         A = self.gram + self.reg * np.eye(self.gram.shape[0]) + (Yr.T * (c - 1.0)) @ Yr
         b = Yr.T @ c
         return np.linalg.solve(A, b)
@@ -152,30 +173,53 @@ class Recommender:
         return w[:k], w[k]
 
     # ---------------------------------------------------------------- recommend
-    def recommend(self, user_ratings, n=20, exclude=()):
-        """user_ratings: {movieId: rating}. Returns (strategy, [movie dicts])."""
-        pairs = [(self.index[int(m)], float(r)) for m, r in user_ratings.items()
-                 if int(m) in self.index and r is not None]
-        blocked = {self.index[int(m)] for m in exclude if int(m) in self.index}
-        blocked |= {k for k, _ in pairs}
+    def collect_signals(self, ratings=None, bookmarks=(), views=None):
+        """Merge a user's interactions into one entry per movie, strongest signal wins.
 
-        if not pairs:
+        Returns parallel arrays: catalog index, confidence weight, genre preference, kind.
+        """
+        signals = {}
+        recent_views = sorted((views or {}).items(), key=lambda kv: kv[1], reverse=True)[:MAX_VIEWS]
+        for m, _ in recent_views:
+            if int(m) in self.index:
+                signals[self.index[int(m)]] = (VIEW_WEIGHT, VIEW_PREF, "viewed")
+        for m in bookmarks or ():
+            if int(m) in self.index:
+                signals[self.index[int(m)]] = (BOOKMARK_WEIGHT, BOOKMARK_PREF, "bookmarked")
+        for m, r in (ratings or {}).items():
+            if int(m) in self.index and r is not None:
+                r = float(r)
+                signals[self.index[int(m)]] = (float(confidence_weight([r])[0]), r - 3.0, "rated")
+        idx = np.fromiter(signals.keys(), dtype=np.int64, count=len(signals))
+        w = np.array([v[0] for v in signals.values()])
+        pref = np.array([v[1] for v in signals.values()])
+        kinds = np.array([v[2] for v in signals.values()])
+        return idx, w, pref, kinds
+
+    def recommend(self, user_ratings=None, n=20, exclude=(), bookmarks=(), views=None):
+        """Personalised picks from ratings ({movieId: stars}), bookmarks ([movieId]) and
+        page views ({movieId: timestamp}). Returns (strategy, [movie dicts], shares).
+
+        Ratings, bookmarks and views steer the ranking with SIGNAL_SHARES (70/20/10);
+        everything the user interacted with is excluded from the results.
+        """
+        idx, w, pref, kinds = self.collect_signals(user_ratings, bookmarks, views)
+        blocked = {self.index[int(m)] for m in exclude if int(m) in self.index} | set(idx.tolist())
+
+        if len(idx) == 0:
             order = [k for k in self.popular_order[: n + len(blocked)] if k not in blocked][:n]
-            return "popular", [self.movie(k) for k in order]
+            return "popular", [self.movie(k) for k in order], {}
 
-        idx = np.array([k for k, _ in pairs])
-        r = np.array([v for _, v in pairs])
-        x = self.fold_in_ials(idx, r)
-        scores = self.Y @ x
+        scores, shares = self.blend_signal_scores(idx, w, kinds)
         strategy = "implicit_als"
 
-        if len(pairs) < HYBRID_MAX_RATINGS:
-            # Very little signal: blend in a genre profile (liked genres up, disliked down).
-            profile = ((r - 3.0)[:, None] * self.G_unit[idx]).sum(axis=0)
+        if w.sum() < HYBRID_MIN_WEIGHT:
+            # Little signal so far: blend in a genre profile (liked genres up, disliked down).
+            profile = (pref[:, None] * self.G_unit[idx]).sum(axis=0)
             content = self.G_unit @ profile
             z = lambda s: (s - s.mean()) / (s.std() + 1e-9)
             pop = np.log1p(self.items["n_ratings"].to_numpy())
-            scores = 0.5 * z(scores) + 0.3 * z(content) + 0.2 * z(pop)
+            scores = 0.5 * scores + 0.3 * z(content) + 0.2 * z(pop)
             strategy = "hybrid"
 
         scores = scores.astype(np.float64)
@@ -183,19 +227,48 @@ class Recommender:
         top = np.argpartition(-scores, n)[:n]
         top = top[np.argsort(-scores[top])]
 
-        p, bu = self.fold_in_mf(idx, r)
-        predicted = np.clip(self.mu + bu + self.bi[top] + self.Q[top] @ p, 0.5, 5.0)
+        # Predicted stars come from the explicit MF model, so they need actual ratings.
+        rated = kinds == "rated"
+        predicted = None
+        if rated.any():
+            stars = pref[rated] + 3.0
+            p, bu = self.fold_in_mf(idx[rated], stars)
+            predicted = np.clip(self.mu + bu + self.bi[top] + self.Q[top] @ p, 0.5, 5.0)
 
-        liked = idx[r >= LIKED_THRESHOLD]
-        sims = self.Y_unit[top] @ self.Y_unit[liked].T if len(liked) else None
+        # Explanation sources: liked ratings, bookmarks, views.
+        src_mask = (~rated) | (pref + 3.0 >= LIKED_THRESHOLD)
+        src_idx, src_kind = idx[src_mask], kinds[src_mask]
+        sims = None
+        if len(src_idx):
+            priority = np.array([REASON_PRIORITY[k] for k in src_kind])
+            sims = (self.Y_unit[top] @ self.Y_unit[src_idx].T) * priority[None, :]
+
         out = []
         for row, k in enumerate(top):
             m = self.movie(k, scores[k])
-            m["predictedRating"] = round(float(predicted[row]) * 2) / 2
+            m["predictedRating"] = None if predicted is None else round(float(predicted[row]) * 2) / 2
             if sims is not None:
                 j = int(np.argmax(sims[row]))
                 if sims[row, j] > 0.2:
-                    src = liked[j]
-                    m["because"] = {"id": int(self.movie_ids[src]), "title": self.items["title"].iloc[src]}
+                    src = src_idx[j]
+                    m["because"] = {"id": int(self.movie_ids[src]),
+                                    "title": self.items["title"].iloc[src],
+                                    "reason": str(src_kind[j])}
             out.append(m)
-        return strategy, out
+        return strategy, out, shares
+
+    def blend_signal_scores(self, idx, w, kinds):
+        """One fold-in per signal kind, z-scored over the catalog, mixed by SIGNAL_SHARES.
+
+        Returns (scores, shares actually used). z-scoring puts the three score vectors on
+        the same scale, so the shares are what decides each kind's influence.
+        """
+        present = {k: v for k, v in SIGNAL_SHARES.items() if (kinds == k).any()}
+        total = sum(present.values())
+        shares = {k: v / total for k, v in present.items()}
+        scores = np.zeros(len(self.Y))
+        for kind, share in shares.items():
+            mask = kinds == kind
+            s = self.Y @ self.fold_in_ials_weighted(idx[mask], w[mask])
+            scores += share * (s - s.mean()) / (s.std() + 1e-9)
+        return scores, {k: round(v, 4) for k, v in shares.items()}
