@@ -1,0 +1,7 @@
+# Offline training only (not installed on Render)
+numpy
+pandas
+pyarrow
+scipy
+numba
+implicit

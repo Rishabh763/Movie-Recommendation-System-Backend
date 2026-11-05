@@ -4,3 +4,5 @@ venv/
 __pycache__/
 *.pyc
 firebase_key.txt
+# ML data (MovieLens licence forbids redistribution)
+data/

@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "dataset": "MovieLens 32M",
+    "train_ratings": 25458060,
+    "test_ratings": 6267836,
+    "users": 200945,
+    "items": 23350,
+    "eval_users": 20000,
+    "k": 10,
+    "relevant_threshold": 4.0,
+    "params": {
+      "mf_reg": 0.05,
+      "ials_alpha": 1.0,
+      "ials_reg": 0.05,
+      "ials_weight": "rating"
+    }
+  },
+  "results": [
+    {
+      "model": "Popularity (most rated)",
+      "fit_seconds": 0.3,
+      "recall@10": 0.07437694444444444,
+      "ndcg@10": 0.07128113469919647,
+      "coverage@10": 0.008650963597430407
+    },
+    {
+      "model": "Popularity (damped mean)",
+      "fit_seconds": 0.3,
+      "recall@10": 0.02599573412698412,
+      "ndcg@10": 0.021049993523644533,
+      "coverage@10": 0.0024839400428265527
+    },
+    {
+      "model": "Bias baseline (mu + b_u + b_i)",
+      "fit_seconds": 9.4,
+      "rmse": 0.8666037321090698,
+      "recall@10": 4e-05,
+      "ndcg@10": 4.7293279348325765e-05,
+      "coverage@10": 0.0005567451820128479
+    },
+    {
+      "model": "Item-kNN (centered cosine)",
+      "fit_seconds": 52.4,
+      "recall@10": 0.11953418650793651,
+      "ndcg@10": 0.11713386369578759,
+      "coverage@10": 0.07820128479657387
+    },
+    {
+      "model": "Biased MF (ALS, k=64)",
+      "fit_seconds": 177.6,
+      "rmse": 0.7883455753326416,
+      "recall@10": 0.0066954563492063485,
+      "ndcg@10": 0.005127459613961267,
+      "coverage@10": 0.22809421841541755
+    },
+    {
+      "model": "Implicit ALS (k=128)",
+      "fit_seconds": 77.8,
+      "recall@10": 0.12615454365079365,
+      "ndcg@10": 0.11740700090467503,
+      "coverage@10": 0.08
+    }
+  ]
+}
