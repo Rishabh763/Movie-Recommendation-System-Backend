@@ -1,9 +1,17 @@
+import os
+
+# Must run before numpy is imported. OpenBLAS otherwise starts one thread per host core,
+# but Render's free instance gets ~0.1 CPU: extra threads burn the CPU quota and get the
+# container throttled. A load test showed ~130 ms extra on every request doing matrix
+# math; one thread is plenty for our 10k x 128 products.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 from flask import Flask, request, jsonify, redirect
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as fb_auth
 from flask_cors import CORS
 from dotenv import load_dotenv
-import os
 import base64
 import json
 
