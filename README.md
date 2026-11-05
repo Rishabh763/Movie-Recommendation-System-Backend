@@ -81,14 +81,46 @@ and scores the catalog with $Yx_u$. That is exactly one ALS user step, so new us
 handled without retraining. Tests check the fold-in against brute-force least squares and
 against the `implicit` library's own `recalculate_user`.
 
-- **Cold start:** no ratings → most popular movies. 1–3 ratings → blend of the ALS score,
-  a genre profile ($\sum (r-3)\cdot g_i$) and popularity, z-scored.
-- **Explanations:** for each recommendation, the user's liked movie (≥ 3.5★) with the
-  highest cosine similarity in the item embedding becomes "Because you liked …".
+- **Ratings, bookmarks and page views** steer the ranking with fixed shares, like an
+  e-commerce funnel (purchase > add to cart > view): **70% ratings, 20% bookmarks, 10%
+  page views**. Each kind gets its own fold-in user vector $x^{(k)}$; the catalog scores
+  $Yx^{(k)}$ are z-normalised and mixed,
+  $$s = \sum_k \pi_k\, z\big(Y x^{(k)}\big),\qquad \pi = (0.7,\ 0.2,\ 0.1),$$
+  with the shares rescaled over the kinds a user actually has (ratings + views only →
+  87.5% / 12.5%). Because the share is per kind rather than per item, 50 page views can't
+  outweigh one rating by count. Within a kind, each item's confidence is $\alpha w$:
+  $w = \max(r-2, 0.5)$ for a rating, 1.5 per bookmark, 0.4 per view (last 100 views). A movie
+  with several signals counts once, under its strongest. Example: with 4 Nolan films rated,
+  adding three horror films raises horror titles in the top 50 from 1 to 1 / 3 / 12 when
+  they are viewed / bookmarked / rated 5★. Everything the user interacted with is excluded
+  from their recommendations; the predicted star rating appears once they have rated
+  something (it comes from the explicit MF model).
+- **Cold start:** no signals → most popular movies. Little signal (total weight < 6, about
+  four good ratings) → blend of the mixed score above, a genre profile ($\sum (r-3)\cdot g_i$, with
+  +1 per bookmark and +0.5 per view) and popularity, z-scored.
+- **Explanations:** for each recommendation, the most similar (cosine in the item embedding)
+  of the user's liked (≥ 3.5★), bookmarked or viewed movies becomes "Because you liked /
+  bookmarked / looked at …", preferring stronger signals on near-ties.
 - **Similar movies:** nearest neighbours by cosine similarity of $y_i$.
 
 Measured locally: artifacts load in 0.3 s, a recommendation takes 3–5 ms, and the process
 peaks at ~185 MB RSS (Render free tier: 512 MB).
+
+### Load test (live Render free instance, ~0.1 CPU)
+
+Requests fired from a browser in Mumbai, so ~250 ms of every number is the round trip to
+Render's Oregon region. 0 errors across ~880 requests.
+
+| Endpoint, 20 concurrent clients | Throughput | p50 | p95 |
+|---|---|---|---|
+| Browse a catalog page | 29.7 req/s | 606 ms | 718 ms |
+| Title search | 24.7 req/s | 687 ms | 1353 ms |
+| Movie details + similar movies (matrix math) | 40.3 req/s | 483 ms | 592 ms |
+
+The first run had the matrix-math endpoint stuck at 6.6 req/s (p50 2.9 s): OpenBLAS
+started one thread per host core on a 0.1-CPU container and got throttled. Pinning BLAS to
+one thread (`app.py`) brought it to 40.3 req/s, a 6× gain, and single-request latency
+from 410 ms down to the 258 ms network floor.
 
 ## API
 
@@ -102,8 +134,8 @@ peaks at ~185 MB RSS (Render free tier: 512 MB).
 | `GET /poster/<movieId>?size=w342` | – | 302 to the TMDB poster image (cached a week) |
 | `GET /recommendations?top=20` | Firebase ID token | Personalised picks with `predictedRating`, `because`, `strategy` |
 
-The user comes from the verified token, never from a parameter; their ratings are read
-from Firestore `users/{uid}.mlRatings`. Posters are resolved by TMDB movie id, then TV id
+The user comes from the verified token, never from a parameter; their signals are read
+from Firestore `users/{uid}`: `mlRatings`, `mlBookmarks` and `mlViews`. Posters are resolved by TMDB movie id, then TV id
 (MovieLens uses TMDB TV ids for miniseries such as *Planet Earth*), then a title + year
 search; results are cached in memory and in Firestore (`tmdb_cache_v2`), so each movie is
 looked up on TMDB at most once.
