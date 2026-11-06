@@ -70,7 +70,8 @@ class Recommender:
         self.items = items
         self.movie_ids = items["movieId"].to_numpy()
         self.index = {int(m): k for k, m in enumerate(self.movie_ids)}
-        self.title_lower = items["title"].str.lower().to_numpy()
+        # Fixed-width unicode array so substring search runs in C (np.char.find), not Python.
+        self.title_lower = items["title"].str.lower().to_numpy().astype(str)
         self.genres = [g.split("|") if g else [] for g in items["genres"]]
         self.all_genres = sorted({g for gs in self.genres for g in gs})
         self.popular_order = np.argsort(-items["n_ratings"].to_numpy(), kind="stable")
@@ -96,6 +97,15 @@ class Recommender:
             for g in gs:
                 G[k, self.genre_index[g]] = 1.0
         self.G_unit = G / np.maximum(np.linalg.norm(G, axis=1, keepdims=True), 1e-9)
+        self.G_bool = G > 0
+
+        # Every sort order is computed once; a search just filters it with a boolean mask.
+        self.sort_orders = {
+            "popular": self.popular_order,
+            "rating": np.argsort(-items["damped_mean"].to_numpy(), kind="stable"),
+            "year": np.argsort(-items["year"].to_numpy(), kind="stable"),
+            "title": np.argsort(self.title_lower, kind="stable"),
+        }
 
     # ---------------------------------------------------------------- catalog
     def movie(self, k, score=None):
@@ -124,19 +134,11 @@ class Recommender:
     def search(self, q="", genre=None, sort="popular", page=1, page_size=24):
         mask = np.ones(len(self.items), dtype=bool)
         if q:
-            ql = q.lower().strip()
-            mask &= np.fromiter((ql in t for t in self.title_lower), dtype=bool, count=len(mask))
+            mask &= np.char.find(self.title_lower, q.lower().strip()) >= 0
         if genre:
-            mask &= np.fromiter((genre in gs for gs in self.genres), dtype=bool, count=len(mask))
-        idx = np.where(mask)[0]
-        if sort == "rating":
-            idx = idx[np.argsort(-self.items["damped_mean"].to_numpy()[idx], kind="stable")]
-        elif sort == "year":
-            idx = idx[np.argsort(-self.items["year"].to_numpy()[idx], kind="stable")]
-        elif sort == "title":
-            idx = idx[np.argsort(self.title_lower[idx], kind="stable")]
-        else:  # popular
-            idx = idx[np.argsort(-self.items["n_ratings"].to_numpy()[idx], kind="stable")]
+            mask &= self.G_bool[:, self.genre_index[genre]]
+        order = self.sort_orders.get(sort, self.popular_order)
+        idx = order[mask[order]]
         start = (page - 1) * page_size
         return {"total": int(len(idx)), "page": page, "pageSize": page_size,
                 "results": [self.movie(k) for k in idx[start:start + page_size]]}

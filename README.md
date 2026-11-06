@@ -3,7 +3,7 @@
 Training pipeline and Flask API for the
 [movie recommender web app](https://github.com/Rishabh763/Movie-Recommendation-System).
 Models are trained offline on **MovieLens 32M** (32M ratings, 200k users) and served from a
-4 MB set of learned embeddings; a website user's ratings are folded into the model in closed
+10 MB set of learned embeddings for all 23,350 trained movies; a website user's ratings are folded into the model in closed
 form on each request, so the API never retrains and answers in a few milliseconds.
 
 ## Results
@@ -75,7 +75,7 @@ $Y^\top Y$ is shared by every user, so it is precomputed once.
 
 ### Serving by fold-in
 
-The API keeps $Y$ (10,000 × 128), $Y^\top Y$, and the MF item factors. For a website
+The API keeps $Y$ (23,350 × 128), $Y^\top Y$, and the MF item factors. For a website
 user with ratings $I_u$, it computes $x_u$ with the formula above (one 128 × 128 solve)
 and scores the catalog with $Yx_u$. That is exactly one ALS user step, so new users are
 handled without retraining. Tests check the fold-in against brute-force least squares and
@@ -103,12 +103,13 @@ against the `implicit` library's own `recalculate_user`.
   bookmarked / looked at …", preferring stronger signals on near-ties.
 - **Similar movies:** nearest neighbours by cosine similarity of $y_i$.
 
-Measured locally: artifacts load in 0.3 s, a recommendation takes 3–5 ms, and the process
-peaks at ~185 MB RSS (Render free tier: 512 MB).
+Measured locally with the full 23,350-movie catalog: the app starts in 0.5 s, a
+recommendation takes ~6 ms, a catalog page < 1 ms, and the process peaks at ~250 MB RSS
+(Render free tier: 512 MB).
 
 ### Load test (live Render free instance, ~0.1 CPU)
 
-Requests fired from a browser in Mumbai, so ~250 ms of every number is the round trip to
+Measured with the earlier 10,000-movie catalog. Requests fired from a browser in Mumbai, so ~250 ms of every number is the round trip to
 Render's Oregon region. 0 errors across ~880 requests.
 
 | Endpoint, 20 concurrent clients | Throughput | p50 | p95 |
@@ -151,7 +152,7 @@ ml/
   models.py         Popularity, bias baseline, item-kNN, biased MF (ALS), implicit ALS
   evaluate.py       Train + evaluate all models, tuning on a validation split
   export.py         Retrain on all ratings, write artifacts/
-artifacts/          Served model (4 MB): item factors, Gram matrix, movie metadata
+artifacts/          Served model (10 MB): item factors, Gram matrix, movie metadata
 reports/            results.md / results.json / tuning.md
 tests/              API, recommender and fold-in tests (pytest)
 ```

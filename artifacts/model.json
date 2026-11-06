@@ -1,7 +1,7 @@
 {
   "dataset": "MovieLens 32M",
   "trained_on_ratings": 31725896,
-  "served_items": 10000,
+  "served_items": 23350,
   "ials": {
     "factors": 128,
     "alpha": 1.0,

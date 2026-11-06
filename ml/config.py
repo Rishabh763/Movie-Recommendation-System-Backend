@@ -19,5 +19,7 @@ RELEVANT_THRESHOLD = 4.0   # a held-out rating >= 4 counts as "relevant"
 EVAL_USERS = 20_000        # sampled test users for ranking metrics
 SEED = 42
 
-# Serving: only the most-rated movies are shipped to the API (Render free tier = 512 MB RAM)
-SERVE_TOP_ITEMS = 10_000
+# Serving: how many of the most-rated movies are shipped to the API. None = every trained
+# movie (23,350 with >= MIN_ITEM_RATINGS ratings); that is ~10 MB of artifacts and well under
+# Render's 512 MB. Set a number to cap it.
+SERVE_TOP_ITEMS = None

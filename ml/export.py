@@ -1,8 +1,8 @@
 """Retrain the chosen models on ALL ratings (train + test) and write serving artifacts.
 
 Evaluation tells us which configuration to ship; once chosen, the production model should
-learn from every rating we have. Only the SERVE_TOP_ITEMS most-rated movies are exported,
-which keeps the artifacts a few MB and the API well under Render's 512 MB.
+learn from every rating we have. Every trained movie is exported unless SERVE_TOP_ITEMS
+caps it; the artifacts stay ~10 MB and the API well under Render's 512 MB.
 
 Usage:
     python -m ml.export --ials-alpha 4 --ials-reg 0.05 --mf-reg 0.05
