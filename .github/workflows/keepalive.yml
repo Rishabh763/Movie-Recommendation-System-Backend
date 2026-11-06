@@ -1,0 +1,20 @@
+name: Keep backend awake
+
+# Render's free tier sleeps after 15 minutes without traffic, and the next visitor waits
+# 30-60 s for it to wake. Pinging every 10 minutes keeps it up; one always-on free instance
+# fits in Render's 750 free hours per month (a 31-day month is 744 hours).
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping health endpoint
+        run: |
+          # --retry covers a cold start if a scheduled run was delayed past the sleep timer
+          curl -fsS --max-time 90 --retry 2 --retry-delay 10 \
+            https://movie-recommendation-system-backend-m2xt.onrender.com/ && echo
